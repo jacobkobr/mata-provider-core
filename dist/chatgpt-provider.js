@@ -38,6 +38,7 @@ function createChatGPTProvider(bridge) {
         const requestId = crypto.randomUUID();
         const queue = [];
         let resolveWaiter = null;
+        let aborted = false;
         const unsubscribe = bridge.onStreamChunk((payload) => {
             if (payload.requestId !== requestId)
                 return;
@@ -45,6 +46,13 @@ function createChatGPTProvider(bridge) {
             resolveWaiter?.();
             resolveWaiter = null;
         });
+        const handleAbort = () => {
+            aborted = true;
+            bridge.cancelStream(requestId).catch(() => { });
+            resolveWaiter?.();
+            resolveWaiter = null;
+        };
+        req.signal?.addEventListener('abort', handleAbort);
         const responsePromise = bridge
             .streamResponse({
             requestId,
@@ -67,7 +75,7 @@ function createChatGPTProvider(bridge) {
             resolveWaiter = null;
         });
         try {
-            while (!done || queue.length > 0) {
+            while (!aborted && (!done || queue.length > 0)) {
                 if (queue.length > 0) {
                     yield { text: queue.shift(), done: false };
                     continue;
@@ -76,11 +84,17 @@ function createChatGPTProvider(bridge) {
                     resolveWaiter = resolve;
                 });
             }
+            if (aborted) {
+                // Matches the DOMException fetch itself throws on an aborted request, so
+                // callers can handle both providers' cancellation the same way.
+                throw new DOMException('The ChatGPT response was cancelled.', 'AbortError');
+            }
             // Propagates a rejected streamResponse (e.g. sharing limit hit mid-stream).
             await responsePromise;
             yield { text: finalText, done: true };
         }
         finally {
+            req.signal?.removeEventListener('abort', handleAbort);
             unsubscribe();
             if (!done) {
                 bridge.cancelStream(requestId).catch(() => { });

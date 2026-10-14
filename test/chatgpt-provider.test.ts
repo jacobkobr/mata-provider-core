@@ -11,7 +11,7 @@ function fakeBridge(overrides: Partial<ChatGPTBridge> = {}): ChatGPTBridge {
     selectProfile: vi.fn(),
     listModels: vi.fn().mockResolvedValue([{ slug: 'gpt-5', displayName: 'GPT-5' }]),
     streamResponse: vi.fn(),
-    cancelStream: vi.fn(),
+    cancelStream: vi.fn().mockResolvedValue(undefined),
     onSessionChanged: vi.fn(() => () => {}),
     onStreamChunk: vi.fn(() => () => {}),
     ...overrides,
@@ -76,5 +76,32 @@ describe('ChatGPTProvider', () => {
     }
 
     await expect(iterate()).rejects.toThrow(/Sign in with ChatGPT/)
+  })
+
+  it('stops and calls cancelStream when the signal is aborted mid-stream', async () => {
+    const bridge = fakeBridge({
+      streamResponse: vi.fn(() => new Promise(() => {})), // never resolves on its own
+    })
+    const provider = createChatGPTProvider(bridge)
+    const controller = new AbortController()
+
+    const iterate = async () => {
+      for await (const _ of provider.generate({
+        model: 'gpt-5',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: controller.signal,
+      })) {
+        // no-op
+      }
+    }
+
+    const pending = iterate()
+    // Let the generator reach its awaiting state (registered listener, in-flight
+    // streamResponse call) before aborting, same as a real UI click mid-stream.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    controller.abort()
+
+    await expect(pending).rejects.toThrow(/cancelled/i)
+    expect(bridge.cancelStream).toHaveBeenCalled()
   })
 })

@@ -68,6 +68,7 @@ export function createChatGPTProvider(bridge: ChatGPTBridge): Provider {
     const requestId = crypto.randomUUID()
     const queue: string[] = []
     let resolveWaiter: (() => void) | null = null
+    let aborted = false
 
     const unsubscribe = bridge.onStreamChunk((payload) => {
       if (payload.requestId !== requestId) return
@@ -75,6 +76,14 @@ export function createChatGPTProvider(bridge: ChatGPTBridge): Provider {
       resolveWaiter?.()
       resolveWaiter = null
     })
+
+    const handleAbort = () => {
+      aborted = true
+      bridge.cancelStream(requestId).catch(() => {})
+      resolveWaiter?.()
+      resolveWaiter = null
+    }
+    req.signal?.addEventListener('abort', handleAbort)
 
     const responsePromise = bridge
       .streamResponse({
@@ -100,7 +109,7 @@ export function createChatGPTProvider(bridge: ChatGPTBridge): Provider {
     })
 
     try {
-      while (!done || queue.length > 0) {
+      while (!aborted && (!done || queue.length > 0)) {
         if (queue.length > 0) {
           yield { text: queue.shift()!, done: false }
           continue
@@ -109,10 +118,16 @@ export function createChatGPTProvider(bridge: ChatGPTBridge): Provider {
           resolveWaiter = resolve
         })
       }
+      if (aborted) {
+        // Matches the DOMException fetch itself throws on an aborted request, so
+        // callers can handle both providers' cancellation the same way.
+        throw new DOMException('The ChatGPT response was cancelled.', 'AbortError')
+      }
       // Propagates a rejected streamResponse (e.g. sharing limit hit mid-stream).
       await responsePromise
       yield { text: finalText, done: true }
     } finally {
+      req.signal?.removeEventListener('abort', handleAbort)
       unsubscribe()
       if (!done) {
         bridge.cancelStream(requestId).catch(() => {})
